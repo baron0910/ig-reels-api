@@ -4,9 +4,7 @@ import { chromium } from 'playwright';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function parseShortCodeFromUrl(link) {
   if (!link) return '';
@@ -14,15 +12,18 @@ function parseShortCodeFromUrl(link) {
   return m ? m[1] : '';
 }
 
+function extractSessionIdFromCookieHeader(cookieHeader) {
+  if (!cookieHeader) return '';
+  // 支援只給 sessionid=... 或整段 Cookie
+  const m = String(cookieHeader).match(/(?:^|;\s*)sessionid=([^;]+)/i);
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
 async function withRetry(task, times = 2, baseDelayMs = 800) {
   let lastErr;
   for (let i = 0; i <= times; i++) {
-    try {
-      return await task();
-    } catch (err) {
-      lastErr = err;
-      await sleep(baseDelayMs * (i + 1));
-    }
+    try { return await task(); }
+    catch (err) { lastErr = err; await sleep(baseDelayMs * (i + 1)); }
   }
   throw lastErr;
 }
@@ -41,6 +42,10 @@ app.get('/api/ig/reels', async (req, res) => {
     return res.status(400).json({ error: '請提供合法 IG reels 列表頁網址，如 https://www.instagram.com/<account>/reels/' });
   }
 
+  // 讀 Header: 優先 X-IG-Cookie，其次 Cookie
+  const headerCookie = req.headers['x-ig-cookie'] || req.headers['cookie'] || '';
+  const sessionId = extractSessionIdFromCookieHeader(headerCookie);
+
   let browser;
   const reels = [];
   let error = null;
@@ -48,37 +53,41 @@ app.get('/api/ig/reels', async (req, res) => {
   try {
     browser = await chromium.launch({
       headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-setuid-sandbox',
-      ],
+      args: ['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-setuid-sandbox'],
     });
 
     const context = await browser.newContext({
       locale: 'zh-TW',
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
+
+    // 僅記憶體注入 Cookie（若有提供）
+    if (sessionId) {
+      await context.addCookies([{
+        name: 'sessionid',
+        value: sessionId,
+        domain: '.instagram.com',
+        path: '/',
+        httpOnly: true,
+        secure: true,
+      }]);
+    }
 
     const page = await context.newPage();
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(45000);
 
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    });
-
+    await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+      // 若提供 Cookie，也加到 Header 以提高穩定性
+      ...(sessionId ? { Cookie: `sessionid=${sessionId}` } : {}),
     });
 
-    // 阻擋非必要資源（加速＋穩定）
+    // 阻擋非必要資源
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['image', 'font', 'stylesheet', 'media'].includes(type)) return route.abort();
-      return route.continue();
+      return ['image','font','stylesheet','media'].includes(type) ? route.abort() : route.continue();
     });
 
     await withRetry(() => page.goto(String(url), { waitUntil: 'networkidle' }), 2);
@@ -89,7 +98,7 @@ app.get('/api/ig/reels', async (req, res) => {
       for (let i = 0; i < maxRounds; i++) {
         await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
         await sleep(900 + Math.floor(Math.random() * 500));
-        const count = await page.$$eval('article [role="presentation"] a', (els) => els.length).catch(() => 0);
+        const count = await page.$$eval('article [role="presentation"] a', els => els.length).catch(() => 0);
         if (count >= target) break;
         if (count === lastCount) break;
         lastCount = count;
@@ -98,22 +107,17 @@ app.get('/api/ig/reels', async (req, res) => {
     await scrollUntil(limit);
 
     // 擷取主列表連結
-    const links = await page.$$eval('article [role="presentation"] a', (as) =>
-      Array.from(new Set(as.map((a) => a.href)))
-    ).catch(() => []);
-    const uniqueLinks = links.filter((l) => /\/reel\//.test(l)).slice(0, limit);
+    const links = await page.$$eval('article [role="presentation"] a',
+      as => Array.from(new Set(as.map(a => a.href)))).catch(() => []);
+    const uniqueLinks = links.filter(l => /\/reel\//.test(l)).slice(0, limit);
 
-    // 逐一擷取（避免高併發被風控）
     for (const link of uniqueLinks) {
       try {
         await withRetry(() => page.goto(link, { waitUntil: 'networkidle' }), 2);
-
         const shortCode = parseShortCodeFromUrl(link);
         const videoUrl =
-          (await page.$eval('video', (el) => el?.src).catch(() => '')) ||
-          (await page.$eval('meta[property="og:video"]', (el) => el?.content).catch(() => '')) ||
-          '';
-
+          (await page.$eval('video', el => el?.src).catch(() => '')) ||
+          (await page.$eval('meta[property="og:video"]', el => el?.content).catch(() => '')) || '';
         const viewCount = await getViewCountText(page);
         reels.push({ shortCode, videoUrl, link, viewCount });
       } catch (e) {
@@ -121,31 +125,15 @@ app.get('/api/ig/reels', async (req, res) => {
       }
     }
 
-    return res.json({
-      url,
-      crawledAt: new Date().toISOString(),
-      count: reels.length,
-      reels,
-      error,
-    });
+    return res.json({ url, crawledAt: new Date().toISOString(), count: reels.length, reels, error });
   } catch (err) {
     error = String(err);
-    return res.status(500).json({
-      url,
-      crawledAt: new Date().toISOString(),
-      count: reels.length,
-      reels,
-      error,
-    });
+    return res.status(500).json({ url, crawledAt: new Date().toISOString(), count: reels.length, reels, error });
   } finally {
     if (browser) await browser.close();
   }
 });
 
-app.get('/', (_req, res) => {
-  res.status(200).send('IG Reels Scraper API Healthy!');
-});
+app.get('/', (_req, res) => { res.status(200).send('IG Reels Scraper API Healthy!'); });
 
-app.listen(PORT, () => {
-  console.log(`IG Reels API running on port ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`IG Reels API running on port ${PORT}`); });
