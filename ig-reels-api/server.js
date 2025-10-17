@@ -19,6 +19,21 @@ function extractSessionIdFromCookieHeader(cookieHeader) {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
+// 解析整串 Cookie 為 { name, value } 陣列
+function parseCookies(header) {
+  return String(header)
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((kv) => {
+      const i = kv.indexOf('=');
+      const name = i >= 0 ? kv.slice(0, i).trim() : kv.trim();
+      const value = i >= 0 ? kv.slice(i + 1).trim() : '';
+      return { name, value };
+    })
+    .filter((c) => c.name && c.value);
+}
+
 async function withRetry(task, times = 2, baseDelayMs = 800) {
   let lastErr;
   for (let i = 0; i <= times; i++) {
@@ -45,6 +60,7 @@ app.get('/api/ig/reels', async (req, res) => {
   // 讀 Header: 優先 X-IG-Cookie，其次 Cookie
   const headerCookie = req.headers['x-ig-cookie'] || req.headers['cookie'] || '';
   const sessionId = extractSessionIdFromCookieHeader(headerCookie);
+  const allCookies = parseCookies(headerCookie);
 
   let browser;
   const reels = [];
@@ -61,16 +77,30 @@ app.get('/api/ig/reels', async (req, res) => {
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
 
-    // 僅記憶體注入 Cookie（若有提供）
-    if (sessionId) {
-      await context.addCookies([{
-        name: 'sessionid',
-        value: sessionId,
-        domain: '.instagram.com',
-        path: '/',
-        httpOnly: true,
-        secure: true,
-      }]);
+    // 注入整串 Cookie（若有提供）
+    if (allCookies.length > 0) {
+      await context.addCookies(
+        allCookies.map((c) => ({
+          name: c.name,
+          value: decodeURIComponent(c.value),
+          domain: '.instagram.com',
+          path: '/',
+          httpOnly: false,
+          secure: true,
+        }))
+      );
+    } else if (sessionId) {
+      // 後備：僅有 sessionid 時也要注入
+      await context.addCookies([
+        {
+          name: 'sessionid',
+          value: sessionId,
+          domain: '.instagram.com',
+          path: '/',
+          httpOnly: true,
+          secure: true,
+        },
+      ]);
     }
 
     const page = await context.newPage();
@@ -81,7 +111,7 @@ app.get('/api/ig/reels', async (req, res) => {
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
       // 若提供 Cookie，也加到 Header 以提高穩定性
-      ...(sessionId ? { Cookie: `sessionid=${sessionId}` } : {}),
+      ...(headerCookie ? { Cookie: headerCookie } : {}),
     });
 
     // 阻擋非必要資源
