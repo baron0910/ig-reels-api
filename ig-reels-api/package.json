@@ -1,12 +1,14 @@
 {
   "name": "ig-reels-api",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "puppeteer": "^23.4.1"
+    "express": "^4.19.2",
+    "playwright": "^1.48.0"
   }
 }
